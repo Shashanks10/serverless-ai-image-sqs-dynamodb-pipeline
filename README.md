@@ -1,0 +1,1 @@
+# serverless-ai-image-sqs-dynamodb-pipeline
