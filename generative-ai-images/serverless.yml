@@ -1,0 +1,197 @@
+service: generative-ai-images-service
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: ${env:AWS_REGION, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  
+  environment:
+    OPENAI_API_KEY: ${ssm:/shashank/open_api_key}
+    QUEUE_URL: ${ssm:/shashank/queue_url}  # Set via SSM after first deployment, or use: https://sqs.${self:provider.region}.amazonaws.com/${aws:accountId}/image-generation-queue-${self:provider.stage}
+    TABLE_NAME: ${ssm:/shashank/dynamodb_table_name}
+    BUCKET_NAME: ${ssm:/shashank/s3bucket_name}
+    SQS_ARN: ${ssm:/shashank/sqs_arn}
+  
+  # IAM permissions for all functions
+  iam:
+    role:
+      statements:
+        # DynamoDB permissions
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+            - dynamodb:Scan
+          Resource:
+            - !GetAtt ImageJobsTable.Arn
+            - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/image-generation-jobs'
+            - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/image-generation-jobs-*'
+        
+        # S3 permissions
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:PutObjectAcl
+          Resource:
+            - !Join ['', [!GetAtt ImageStorageBucket.Arn, '/*']]
+            - !Sub 'arn:aws:s3:::shashank-ai-image-generative/*'
+            - !Sub 'arn:aws:s3:::shashank-ai-image-generative-*/*'
+        
+        # SQS permissions
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - !GetAtt ImageGenerationQueue.Arn
+            - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:shashank-image-generation-queue'
+            - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:shashank-image-generation-queue-*'
+
+functions:
+  reciverLambda:
+    handler: handlers/reciver_lambda.handler
+    timeout: 30  # Only needs to write to DynamoDB and SQS
+    memorySize: 256
+    events:
+      - http:
+          path: /generative-ai-images/generate
+          method: post
+          cors: true
+          private: false
+
+  responderLambda:
+    handler: handlers/responder_lambda.handler
+    timeout: 30  # Only needs to read from DynamoDB
+    memorySize: 256
+    events:
+      - http:
+          path: /generative-ai-images/status/{jobId}
+          method: get
+          cors: true
+          private: false
+          request:
+            parameters:
+              paths:
+                jobId: true  # Make jobId required
+
+  workerLambda:
+    handler: handlers/worker_lambda.handler
+    timeout: 900  # 15 minutes - CRITICAL for AI image generation
+    memorySize: 1024  # Increased for image processing
+    # Note: reservedConcurrency removed - AWS requires min 10 unreserved concurrent executions
+    # Control throughput via SQS batchSize and maximumBatchingWindowInSeconds instead
+    # SQS event source mapping created manually in resources section to use SSM parameter
+    environment:
+      NODE_OPTIONS: '--max-old-space-size=896'  # Prevent memory issues
+
+# Optional: Define SQS queue in CloudFormation
+resources:
+  Resources:
+    # Event Source Mapping for Worker Lambda to consume from SQS
+    # Using the queue ARN pattern that matches the actual queue name
+    WorkerLambdaEventSourceMapping:
+      Type: AWS::Lambda::EventSourceMapping
+      Properties:
+        EventSourceArn: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:shashank-image-generation-queue'
+        FunctionName: !Sub '${self:service}-${self:provider.stage}-workerLambda'
+        BatchSize: 1
+        MaximumBatchingWindowInSeconds: 0
+        FunctionResponseTypes:
+          - ReportBatchItemFailures
+    
+    ImageGenerationQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: image-generation-queue-${self:provider.stage}
+        VisibilityTimeout: 900  # MUST match worker Lambda timeout
+        MessageRetentionPeriod: 345600  # 4 days
+        ReceiveMessageWaitTimeSeconds: 20  # Long polling
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ImageGenerationDLQ.Arn
+          maxReceiveCount: 3
+    
+    ImageGenerationDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: image-generation-dlq-${self:provider.stage}
+        MessageRetentionPeriod: 1209600  # 14 days
+    
+    # DynamoDB Table
+    ImageJobsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: image-generation-jobs-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST  # On-demand pricing
+        AttributeDefinitions:
+          - AttributeName: jobId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: jobId
+            KeyType: HASH
+        TimeToLiveSpecification:
+          Enabled: true
+          AttributeName: ttl
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+    
+    # S3 Bucket
+    ImageStorageBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: shashank-ai-image-generative-${self:provider.stage}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteOldImages
+              Status: Enabled
+              ExpirationInDays: 7  # Auto-delete images after 7 days
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ['*']
+              AllowedMethods: [GET, HEAD]
+              AllowedOrigins: ['*']
+              MaxAge: 3600
+
+  Outputs:
+    QueueUrl:
+      Description: SQS Queue URL
+      Value: !Ref ImageGenerationQueue
+      Export:
+        Name: ${self:service}-${self:provider.stage}-queue-url
+    
+    QueueArn:
+      Description: SQS Queue ARN
+      Value: !GetAtt ImageGenerationQueue.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-queue-arn
+    
+    TableName:
+      Description: DynamoDB Table Name
+      Value: !Ref ImageJobsTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-table-name
+    
+    BucketName:
+      Description: S3 Bucket Name
+      Value: !Ref ImageStorageBucket
+      Export:
+        Name: ${self:service}-${self:provider.stage}-bucket-name
+
+plugins:
+  - serverless-offline  # For local testing
